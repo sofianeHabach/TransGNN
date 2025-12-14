@@ -7,7 +7,7 @@ from Params import args
 class AttentionSampling:
     """
     Module d'échantillonnage d'attention (Section 3.2 de l'article)
-    Version corrigée et optimisée
+    Version MEMORY-EFFICIENT pour grands graphes
     """
     
     def __init__(self, num_nodes, embedding_dim, sample_size=20, alpha=0.5):
@@ -18,100 +18,120 @@ class AttentionSampling:
         self.attention_samples = None
         self.attention_scores = None
         
-    def compute_similarity_matrix(self, embeddings, adj_matrix=None):
+    def compute_similarity_batched(self, embeddings, batch_size=1000):
         """
-        Calcule la matrice de similarité selon Eq. 1 et 2 de l'article
-        Version optimisée pour éviter out-of-memory
+        Calcule top-k similarités SANS créer la matrice complète NxN
+        Économie massive de mémoire!
+        
+        Args:
+            embeddings: (N, d)
+            batch_size: Taille des batches
+            
+        Returns:
+            top_indices: (N, k) - indices des k plus similaires
+            top_scores: (N, k) - scores de similarité
         """
-        # Étape 1: Similarité sémantique brute (Eq. 1)
+        N = embeddings.shape[0]
+        k = min(self.sample_size, N - 1)
+        
+        # Normaliser embeddings
         embeddings_normalized = t.nn.functional.normalize(embeddings, p=2, dim=1)
         
-        # Pour grands graphes, calculer par batch
-        if self.num_nodes > 10000:
-            similarity = self._compute_similarity_batched(embeddings_normalized)
-        else:
-            similarity = t.mm(embeddings_normalized, embeddings_normalized.t())
-        
-        # Étape 2: Incorporer préférences des voisins (Eq. 2)
-        if adj_matrix is not None and self.alpha > 0:
-            # S = S + α * Â * S
-            # Convertir S en dense si sparse (pour calcul efficace)
-            if similarity.is_sparse:
-                similarity_dense = similarity.to_dense()
-            else:
-                similarity_dense = similarity
-            
-            # Multiplication sparse @ dense
-            similarity_propagated = t.sparse.mm(adj_matrix, similarity_dense)
-            
-            # Ajouter identité à adj_matrix (self-loops)
-            # Créer matrice identité sparse
-            indices = t.arange(self.num_nodes).unsqueeze(0).repeat(2, 1).cuda()
-            values = t.ones(self.num_nodes).cuda()
-            identity = t.sparse_coo_tensor(indices, values, adj_matrix.shape).cuda()
-            
-            # Â = A + I
-            adj_with_self = adj_matrix + identity
-            
-            # Propager similarité
-            similarity_propagated = t.sparse.mm(adj_with_self, similarity_dense)
-            similarity = similarity_dense + self.alpha * similarity_propagated
-        
-        return similarity
-    
-    def _compute_similarity_batched(self, embeddings_normalized, batch_size=1000):
-        """
-        Calcule similarité par batch pour économiser mémoire
-        """
-        N = embeddings_normalized.shape[0]
-        similarity = t.zeros((N, N), device=embeddings_normalized.device)
-        
-        for i in range(0, N, batch_size):
-            end_i = min(i + batch_size, N)
-            batch_i = embeddings_normalized[i:end_i]
-            
-            # Calculer similarité pour ce batch
-            sim_batch = t.mm(batch_i, embeddings_normalized.t())
-            similarity[i:end_i] = sim_batch
-        
-        return similarity
-    
-    def sample_attention_nodes(self, similarity_matrix, exclude_self=True):
-        """
-        Échantillonne les top-k nœuds les plus similaires
-        Version optimisée par batch
-        """
-        N = similarity_matrix.shape[0]
-        k = min(self.sample_size, N - 1) if exclude_self else self.sample_size
-        
-        if exclude_self:
-            # Mettre -inf sur la diagonale
-            mask = t.eye(N, dtype=t.bool, device=similarity_matrix.device)
-            similarity_matrix = similarity_matrix.masked_fill(mask, float('-inf'))
-        
-        # Échantillonner par batch pour économiser mémoire
-        batch_size = 2000
         all_indices = []
         all_scores = []
         
+        print(f"   Échantillonnage par batch ({batch_size} nœuds/batch)...")
+        total_batches = (N + batch_size - 1) // batch_size
+        
         for start in range(0, N, batch_size):
             end = min(start + batch_size, N)
-            batch_sim = similarity_matrix[start:end]
             
-            top_scores, top_indices = t.topk(batch_sim, k, dim=1)
+            if start % 10000 == 0:
+                print(f"     Batch {start//batch_size + 1}/{total_batches}...")
+            
+            # Batch de queries (batch_size, d)
+            batch_queries = embeddings_normalized[start:end]
+            
+            # Similarité avec TOUS les nœuds (batch_size, N)
+            batch_similarities = t.mm(batch_queries, embeddings_normalized.t())
+            
+            # Masquer self-loops (mettre -inf sur diagonale)
+            for i in range(batch_similarities.shape[0]):
+                global_idx = start + i
+                batch_similarities[i, global_idx] = float('-inf')
+            
+            # Top-k pour ce batch
+            top_scores, top_indices = t.topk(batch_similarities, k, dim=1)
             
             # Remplacer -inf par 0
             top_scores = t.where(
-                t.isinf(top_scores), 
-                t.zeros_like(top_scores), 
+                t.isinf(top_scores),
+                t.zeros_like(top_scores),
                 top_scores
             )
             
             all_indices.append(top_indices)
             all_scores.append(top_scores)
+            
+            # Libérer mémoire
+            del batch_similarities
+            t.cuda.empty_cache()
         
-        self.attention_samples = t.cat(all_indices, dim=0)
-        self.attention_scores = t.cat(all_scores, dim=0)
+        # Concatener résultats
+        self.attention_samples = t.cat(all_indices, dim=0)  # (N, k)
+        self.attention_scores = t.cat(all_scores, dim=0)    # (N, k)
+        
+        return self.attention_samples, self.attention_scores
+    
+    def compute_similarity_with_propagation(self, embeddings, adj_matrix, batch_size=1000):
+        """
+        Version avec propagation de voisinage (Eq. 2 de l'article)
+        Mais en mode memory-efficient
+        
+        S = S_semantic + α * A * S_semantic
+        """
+        N = embeddings.shape[0]
+        k = min(self.sample_size, N - 1)
+        
+        # Normaliser embeddings
+        embeddings_normalized = t.nn.functional.normalize(embeddings, p=2, dim=1)
+        
+        # Propager via adjacence (A * E)
+        if adj_matrix is not None and self.alpha > 0:
+            print("   Propagation via matrice d'adjacence...")
+            propagated_embeds = t.sparse.mm(adj_matrix, embeddings_normalized)
+            
+            # Combiner: E_final = E + α * (A * E)
+            embeddings_combined = embeddings_normalized + self.alpha * propagated_embeds
+            embeddings_combined = t.nn.functional.normalize(embeddings_combined, p=2, dim=1)
+        else:
+            embeddings_combined = embeddings_normalized
+        
+        # Échantillonner sur embeddings combinés
+        return self.compute_similarity_batched(embeddings_combined, batch_size)
+    
+    def sample_attention_nodes(self, embeddings, adj_matrix=None, use_propagation=False):
+        """
+        Échantillonne les top-k nœuds les plus similaires
+        Version memory-efficient
+        
+        Args:
+            embeddings: (N, d) - peut être tensor ou on calcule depuis scratch
+            adj_matrix: Matrice d'adjacence sparse (optionnel)
+            use_propagation: Si True, utilise Eq. 2 avec propagation de voisinage
+        """
+        # Déterminer batch size basé sur mémoire disponible
+        if self.num_nodes > 50000:
+            batch_size = 500  # Très grand graphe
+        elif self.num_nodes > 20000:
+            batch_size = 1000  # Grand graphe
+        else:
+            batch_size = 2000  # Graphe moyen
+        
+        if use_propagation and adj_matrix is not None:
+            self.compute_similarity_with_propagation(embeddings, adj_matrix, batch_size)
+        else:
+            self.compute_similarity_batched(embeddings, batch_size)
         
         return self.attention_samples, self.attention_scores
     
@@ -138,19 +158,22 @@ class AttentionSampling:
         
         return sampled_embeds
     
-    def update_samples(self, embeddings, adj_matrix=None):
+    def update_samples(self, embeddings, adj_matrix=None, use_propagation=False):
         """Recalcule les échantillons avec nouveaux embeddings"""
-        print("   Recalcul similarité...")
-        similarity = self.compute_similarity_matrix(embeddings, adj_matrix)
-        print("   Échantillonnage top-k...")
-        self.sample_attention_nodes(similarity)
+        print("   🔄 Recalcul similarité...")
+        self.sample_attention_nodes(embeddings, adj_matrix, use_propagation)
         print("   ✓ Échantillons mis à jour")
 
 
-def create_attention_sampling(handler, sample_size=20):
+def create_attention_sampling(handler, sample_size=20, use_propagation=False):
     """
     Crée et initialise le module d'attention sampling
-    Version simplifiée pour éviter erreurs
+    Version memory-efficient pour grands graphes
+    
+    Args:
+        handler: DataHandler
+        sample_size: Nombre d'échantillons (k)
+        use_propagation: Si True, utilise Eq. 2 avec propagation
     """
     num_nodes = args.user + args.item
     embedding_dim = args.latdim
@@ -163,21 +186,23 @@ def create_attention_sampling(handler, sample_size=20):
     )
     
     print("🔍 Initialisation de l'attention sampling...")
+    print(f"   Graphe: {num_nodes} nœuds ({args.user} users + {args.item} items)")
     
     # Initialiser avec embeddings aléatoires
     initial_embeds = t.randn(num_nodes, embedding_dim).cuda()
     
-    # Calculer similarité SANS adjacence pour la première fois
-    # (évite les problèmes avec matrice sparse)
-    print("   Calcul similarité initiale (sémantique seulement)...")
-    similarity = sampler.compute_similarity_matrix(
-        initial_embeds, 
-        adj_matrix=None  # Pas d'adjacence pour l'init
+    # Calculer similarité et échantillonner
+    print("   Calcul similarité initiale...")
+    sampler.sample_attention_nodes(
+        initial_embeds,
+        adj_matrix=handler.torchBiAdj if use_propagation else None,
+        use_propagation=use_propagation
     )
     
-    print("   Échantillonnage des top-k nœuds...")
-    sampler.sample_attention_nodes(similarity)
-    
     print(f"✅ Échantillonnage créé: {sample_size} nœuds par nœud central")
+    
+    # Estimer mémoire utilisée
+    memory_mb = (num_nodes * sample_size * 4) / (1024**2)  # 4 bytes par int32
+    print(f"   Mémoire cache: ~{memory_mb:.1f} MB")
     
     return sampler
